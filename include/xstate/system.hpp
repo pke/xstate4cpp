@@ -310,9 +310,14 @@ inline void Actor::executeEffect(Effect& e) {
       std::weak_ptr<Actor> self = weak_from_this();
       const Event ev = e.event;
       const std::string target = e.target;
+      const std::string sendId = e.id;
+      // timer callbacks run on the loop/executor context (adapter contract),
+      // so erasing the consumed timer here is race-free — and required, or a
+      // later CancelTimer would "clear" an already-fired platform timer
       timers_[e.id] = clock_->setTimeout(
-          [self, ev, target] {
+          [self, ev, target, sendId] {
             if (auto s = self.lock()) {
+              s->timers_.erase(sendId);
               if (ActorRef t = s->resolveTarget(target)) t->send(ev);
             }
           },

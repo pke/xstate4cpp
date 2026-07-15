@@ -196,6 +196,7 @@ struct StateConfig {
 template <typename C>
 struct MachineConfig {
   std::string id = "(machine)";
+  StateType type = StateType::Compound;  // Compound or Parallel roots only
   std::string initial;
   C context{};
   OrderedMap<StateConfig<C>> states;

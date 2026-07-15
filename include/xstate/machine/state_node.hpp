@@ -36,6 +36,7 @@ struct StateNode {
     std::optional<GuardRef<C>> guard;
     std::vector<ActionRef<C>> actions;
     bool reenter = false;
+    bool forbidden = false;  // `on: { EV: {} }`: blocks bubbling, does nothing
     StateNode* source = nullptr;
   };
   std::vector<TransitionDef> transitions;  // definition order

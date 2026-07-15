@@ -180,19 +180,19 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
     std::vector<const Node*> cfg;
     addInitial(root_.get(), cfg);
     C draft = config_.context;
-    MicroCtx mc{draft, scope, nullptr, 0};
+    std::deque<Event> internalQ;
+    MicroCtx mc{draft, scope, &internalQ, 0};
     const Event initEvent = events::init();
+    emitInvokeEffects({}, cfg, scope);  // children exist before entry sendTo effects
     for (const Node* n : cfg) executeActions(n->entry, mc, initEvent);
+    emitDelayEffects({}, cfg, draft, initEvent, scope);
     snap->configuration = std::move(cfg);
     snap->context = std::move(draft);
-    std::deque<Event> internalQ;
     std::set<const Node*> active(snap->configuration.begin(), snap->configuration.end());
-    emitDelayEffects({}, snap->configuration, snap->context, initEvent, scope);
-    emitInvokeEffects({}, snap->configuration, scope);
     processFinals(snap->configuration, active, snap->context, initEvent, internalQ, *snap);
     finalizeSnapshot(*snap);
     // settle eventless transitions / done events raised by the initial entry
-    return stabilize(snap, scope, internalQ);
+    return finishIfDone(stabilize(snap, scope, internalQ), initEvent, scope);
   }
 
   SnapshotPtr transition(SnapshotPtr current, const Event& event, ActorScope& scope) override {
@@ -203,7 +203,38 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
     if (selected.empty()) return current;
     std::deque<Event> internalQ;
     auto snap = microstep(selected, *cur, event, scope, internalQ);
-    return stabilize(snap, scope, internalQ);
+    return finishIfDone(stabilize(snap, scope, internalQ), event, scope);
+  }
+
+  // A machine that reached its top-level final state stops: exit actions of
+  // every active state run in reverse document order (root included), timers
+  // are cancelled, and invoked children are stopped — matching v5.
+  std::shared_ptr<const Snap> finishIfDone(std::shared_ptr<const Snap> snap, const Event& event,
+                                           ActorScope& scope) {
+    if (snap->status != SnapshotStatus::Done) return snap;
+    auto next = std::make_shared<Snap>(*snap);
+    C draft = next->context;
+    std::deque<Event> discarded;  // events raised while finishing go nowhere
+    MicroCtx mc{draft, scope, &discarded, 0};
+    std::vector<const Node*> reverse(next->configuration.rbegin(), next->configuration.rend());
+    for (const Node* n : reverse) executeActions(n->exit, mc, event);
+    emitDelayEffects(reverse, {}, draft, event, scope);
+    emitInvokeEffects(reverse, {}, scope);
+    next->context = std::move(draft);
+    return next;
+  }
+
+  // External stop (actor.stop() / parent stopping an invoked child): run the
+  // exit actions of the active configuration, deepest-first.
+  void onStop(SnapshotPtr current, ActorScope& scope) override {
+    auto cur = machineSnapshot<C>(current);
+    if (cur == nullptr || cur->status != SnapshotStatus::Active) return;
+    C draft = cur->context;
+    std::deque<Event> discarded;
+    MicroCtx mc{draft, scope, &discarded, 0};
+    const Event stopEvent{"xstate.stop"};
+    for (auto it = cur->configuration.rbegin(); it != cur->configuration.rend(); ++it)
+      executeActions((*it)->exit, mc, stopEvent);
   }
 
   bool canTransition(const Snap& snap, const Event& event) const {
@@ -268,6 +299,7 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
     ActorScope& scope;
     std::deque<Event>* internalQ;
     int sendCounter;
+    bool assigned = false;  // an Assign action ran (drives eventless re-evaluation)
   };
 
   void executeActions(const std::vector<ActionRef<C>>& actions, MicroCtx& mc,
@@ -278,8 +310,11 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
         case K::Named:
           options_.actions.at(a.name)(mc.draft, event);
           break;
-        case K::Inline:
         case K::Assign:
+          mc.assigned = true;
+          a.fn(mc.draft, event);
+          break;
+        case K::Inline:
           a.fn(mc.draft, event);
           break;
         case K::Raise:
@@ -360,9 +395,16 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
 
   // Configuration = all active nodes (atomics + their ancestors), document order.
   void addInitial(const Node* n, std::vector<const Node*>& cfg) const {
+    // history nodes never join the configuration; resolve through them
+    // (no recorded value can exist on an initial path -> default target)
+    if (n->type == StateType::History) {
+      if (n->historyDefault != nullptr) addInitial(n->historyDefault, cfg);
+      return;
+    }
     cfg.push_back(n);
     if (n->type == StateType::Parallel) {
-      for (const auto& ch : n->children) addInitial(ch.get(), cfg);
+      for (const auto& ch : n->children)
+        if (ch->type != StateType::History) addInitial(ch.get(), cfg);
     } else if (n->initial != nullptr) {
       addInitial(n->initial, cfg);
     }
@@ -455,7 +497,10 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
       if (!isAtomic) continue;
       for (const Node* s = n; s != nullptr; s = s->parent) {
         if (const TransitionDef* def = selectForNode(s, event, snap)) {
-          if (std::find(selected.begin(), selected.end(), def) == selected.end())
+          // a forbidden entry blocks the event from bubbling further but
+          // contributes no transition itself
+          if (!def->forbidden &&
+              std::find(selected.begin(), selected.end(), def) == selected.end())
             selected.push_back(def);
           break;
         }
@@ -488,20 +533,23 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
 
   // ---- exit/entry set computation ----
 
-  // Transition domain: source itself for internal (descendant target, no
-  // reenter); otherwise the lowest common ancestor of {source} U targets.
+  // Transition domain: the source itself when every target is the source or
+  // one of its descendants and reenter is false (internal / default
+  // self-transition: descendants re-enter, the source does not). Otherwise
+  // the lowest compound PROPER ancestor of {source} U targets — targeting an
+  // ancestor therefore exits and re-enters that ancestor.
   const Node* transitionDomain(const TransitionDef* def) const {
     if (def->targets.empty()) return nullptr;
     if (!def->reenter) {
       bool allInside = true;
       for (const Node* t : def->targets)
-        if (t == def->source || !t->isDescendantOf(def->source)) { allInside = false; break; }
+        if (!t->isDescendantOf(def->source)) { allInside = false; break; }
       if (allInside) return def->source;
     }
     for (const Node* a = def->source->parent; a != nullptr; a = a->parent) {
       bool coversAll = true;
       for (const Node* t : def->targets)
-        if (t != a && !t->isDescendantOf(a)) { coversAll = false; break; }
+        if (t == a || !t->isDescendantOf(a)) { coversAll = false; break; }
       if (coversAll && a->type != StateType::Parallel) return a;
     }
     return root_.get();
@@ -626,9 +674,13 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
   bool isInFinal(const Node* n, const std::set<const Node*>& active) const {
     if (n->type == StateType::Final) return active.count(n) != 0;
     if (n->type == StateType::Parallel) {
-      for (const auto& ch : n->children)
+      bool anyRegion = false;
+      for (const auto& ch : n->children) {
+        if (ch->type == StateType::History) continue;  // ignored for done-ness
+        anyRegion = true;
         if (!isInFinal(ch.get(), active)) return false;
-      return !n->children.empty();
+      }
+      return anyRegion;
     }
     for (const auto& ch : n->children)
       if (active.count(ch.get()) != 0) return isInFinal(ch.get(), active);
@@ -637,51 +689,71 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
 
   // Raises done.state events for compound parents of newly-entered final
   // states (and parallel ancestors that thereby completed); marks the machine
-  // Done when the root reaches a final state.
+  // Done when the root reaches a final state. Each done event is raised at
+  // most once per microstep (several regions may finish simultaneously).
   void processFinals(const std::vector<const Node*>& entered,
                      const std::set<const Node*>& active, const C& ctx, const Event& event,
                      std::deque<Event>& internalQ, Snap& snap) const {
+    std::set<std::string> raisedTypes;
+    auto raiseOnce = [&](std::string type, std::any data) {
+      if (raisedTypes.insert(type).second)
+        internalQ.push_back(Event{std::move(type), std::move(data)});
+    };
     for (const Node* f : entered) {
       if (f->type != StateType::Final) continue;
       const Node* p = f->parent;
       if (p == nullptr) continue;
-      std::any out = resolveOutput(f->output, ctx, event);
-      if (p == root_.get()) {
+      if (p == root_.get() && p->type != StateType::Parallel) {
         snap.status = SnapshotStatus::Done;
-        snap.output = out;
+        snap.output = resolveOutput(f->output, ctx, event);
         continue;
       }
+      // a final state's output is not resolved when its parent is parallel
       if (p->type != StateType::Parallel)
-        internalQ.push_back(Event{"xstate.done.state." + p->id, out});
+        raiseOnce("xstate.done.state." + p->id, resolveOutput(f->output, ctx, event));
       for (const Node* a = p; a->parent != nullptr; a = a->parent) {
         const Node* pp = a->parent;
-        if (pp->type == StateType::Parallel && isInFinal(pp, active))
-          internalQ.push_back(Event{"xstate.done.state." + pp->id});
+        if (pp->type == StateType::Parallel && pp != root_.get() && isInFinal(pp, active))
+          raiseOnce("xstate.done.state." + pp->id, {});
       }
     }
+    // a parallel root completes when every region is in a final state
+    if (snap.status == SnapshotStatus::Active && root_->type == StateType::Parallel &&
+        !entered.empty() && isInFinal(root_.get(), active))
+      snap.status = SnapshotStatus::Done;
   }
 
   // ---- macrostep loop ----
 
   // Run always-transitions and internally raised events until stable.
+  // Eventless transitions are re-evaluated after every microstep, but a
+  // targetless eventless microstep that neither changed the configuration
+  // nor ran an assign stops the eventless loop (v5: run once per event, not
+  // forever) until the next queued event is processed.
   std::shared_ptr<const Snap> stabilize(std::shared_ptr<const Snap> snap, ActorScope& scope,
                                         std::deque<Event>& internalQ) {
     const Event eventless{""};
     std::size_t steps = 0;
+    bool alwaysEnabled = true;
     while (true) {
       if (snap->status != SnapshotStatus::Active) return snap;
       if (++steps > 1000000)
         throw ConfigError("infinite loop detected in always transitions");
-      auto alwaysSel = selectTransitions(*snap, eventless);
-      if (!alwaysSel.empty()) {
-        snap = microstep(alwaysSel, *snap, eventless, scope, internalQ);
-        continue;
+      if (alwaysEnabled) {
+        auto alwaysSel = selectTransitions(*snap, eventless);
+        if (!alwaysSel.empty()) {
+          bool progress = false;
+          snap = microstep(alwaysSel, *snap, eventless, scope, internalQ, &progress);
+          if (!progress) alwaysEnabled = false;
+          continue;
+        }
       }
       if (!internalQ.empty()) {
         Event e = std::move(internalQ.front());
         internalQ.pop_front();
         auto sel = selectTransitions(*snap, e);
         if (!sel.empty()) snap = microstep(sel, *snap, e, scope, internalQ);
+        alwaysEnabled = true;  // a processed event re-arms eventless evaluation
         continue;
       }
       return snap;
@@ -692,7 +764,8 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
 
   std::shared_ptr<const Snap> microstep(const std::vector<const TransitionDef*>& selected,
                                         const Snap& cur, const Event& event, ActorScope& scope,
-                                        std::deque<Event>& internalQ) {
+                                        std::deque<Event>& internalQ,
+                                        bool* madeProgress = nullptr) {
     std::set<const Node*> active(cur.configuration.begin(), cur.configuration.end());
     C draft = cur.context;
     MicroCtx mc{draft, scope, &internalQ, 0};
@@ -729,6 +802,10 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
     }
 
     for (const Node* n : exitOrdered) executeActions(n->exit, mc, event);
+    // cancel timers and stop invoked children of exited states (after their
+    // exit actions so those actions can still talk to the children)
+    emitDelayEffects(exitOrdered, {}, draft, event, scope);
+    emitInvokeEffects(exitOrdered, {}, scope);
 
     // transition actions, selection order
     for (const TransitionDef* def : selected) executeActions(def->actions, mc, event);
@@ -740,9 +817,6 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
       const Node* domain = transitionDomain(def);
       for (const Node* t : def->targets) computeEntrySet(domain, t, entered, newHistory);
     }
-    std::sort(entered.begin(), entered.end(),
-              [](const Node* a, const Node* b) { return a->docIndex < b->docIndex; });
-    entered.erase(std::unique(entered.begin(), entered.end()), entered.end());
 
     // new configuration = (active - exited) + entered (deduped), doc order
     std::set<const Node*> nextActive;
@@ -751,7 +825,19 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
     std::vector<const Node*> toEnter;
     for (const Node* n : entered)
       if (nextActive.insert(n).second) toEnter.push_back(n);
+
+    // configuration completion: an active compound needs an active child, an
+    // active parallel needs ALL regions active (e.g. a cross-region target
+    // exited the source region — it re-enters via its initial states)
+    completeConfiguration(nextActive, toEnter);
+    std::sort(toEnter.begin(), toEnter.end(),
+              [](const Node* a, const Node* b) { return a->docIndex < b->docIndex; });
+
+    // invoked children spawn before entry actions execute so that entry
+    // sendTo(childId, ...) effects find their target
+    emitInvokeEffects({}, toEnter, scope);
     for (const Node* n : toEnter) executeActions(n->entry, mc, event);
+    emitDelayEffects({}, toEnter, draft, event, scope);
 
     auto next = std::make_shared<Snap>();
     next->machine = this->shared_from_this();
@@ -761,11 +847,39 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
     next->context = std::move(draft);
     next->children = cur.children;
     next->historyValue = std::move(newHistory);
-    emitDelayEffects(exitOrdered, toEnter, next->context, event, scope);
-    emitInvokeEffects(exitOrdered, toEnter, scope);
     processFinals(toEnter, nextActive, next->context, event, internalQ, *next);
     finalizeSnapshot(*next);
+    if (madeProgress != nullptr)
+      *madeProgress = !exitSet.empty() || !toEnter.empty() || mc.assigned;
     return next;
+  }
+
+  // Expand incomplete compound/parallel nodes down to their initial states,
+  // treating everything added as freshly entered.
+  void completeConfiguration(std::set<const Node*>& nextActive,
+                             std::vector<const Node*>& toEnter) const {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      std::vector<const Node*> snapshot(nextActive.begin(), nextActive.end());
+      for (const Node* n : snapshot) {
+        std::vector<const Node*> add;
+        if (n->type == StateType::Parallel) {
+          for (const auto& region : n->children)
+            if (nextActive.count(region.get()) == 0) addInitial(region.get(), add);
+        } else if (n->type == StateType::Compound && n->initial != nullptr) {
+          bool hasActiveChild = false;
+          for (const auto& ch : n->children)
+            if (nextActive.count(ch.get()) != 0) { hasActiveChild = true; break; }
+          if (!hasActiveChild) addInitial(n->initial, add);
+        }
+        for (const Node* a : add)
+          if (nextActive.insert(a).second) {
+            toEnter.push_back(a);
+            changed = true;
+          }
+      }
+    }
   }
 
   MachineConfig<C> config_;
@@ -798,7 +912,12 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
     root_->path = "";
     root_->docIndex = docCounter_++;
     root_->id = config_.id;
-    root_->type = config_.states.empty() ? StateType::Atomic : StateType::Compound;
+    if (config_.type == StateType::Parallel) {
+      if (config_.states.empty()) fail("type", "parallel machine needs states");
+      root_->type = StateType::Parallel;
+    } else {
+      root_->type = config_.states.empty() ? StateType::Atomic : StateType::Compound;
+    }
     root_->entry = config_.entry;
     root_->exit = config_.exit;
     root_->output = config_.output;
@@ -904,9 +1023,20 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
       if (node->initial == nullptr)
         fail(prefix + "initial", "unknown initial state '" + initialName + "'");
     }
-    for (auto& [evt, list] : on)
+    for (auto& [evt, list] : on) {
+      if (list.list.empty()) {
+        // forbidden event (v5 `EVENT: undefined`): selected but does nothing,
+        // which blocks the event from bubbling to ancestor handlers
+        TransitionDef def;
+        def.eventType = evt;
+        def.forbidden = true;
+        def.source = node;
+        node->transitions.push_back(std::move(def));
+        continue;
+      }
       for (auto& tc : list.list)
         addTransition(node, evt, tc, prefix + "on." + evt);
+    }
     for (auto& tc : always)
       addTransition(node, "", tc, prefix + "always");
   }

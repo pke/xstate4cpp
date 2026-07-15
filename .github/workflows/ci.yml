@@ -28,7 +28,7 @@ jobs:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DXSTATE_BUILD_TESTS=ON -DXSTATE_BUILD_EXAMPLES=ON
       - name: Build
@@ -51,7 +51,7 @@ jobs:
       # overriding CMAKE_CXX_FLAGS which would replace them
       CXXFLAGS: ${{ matrix.flags }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure
         run: cmake -S . -B build -DXSTATE_BUILD_TESTS=ON -DXSTATE_BUILD_EXAMPLES=ON
       - name: Build
@@ -63,7 +63,7 @@ jobs:
       CXXFLAGS: -fsanitize=address,undefined -g
       LDFLAGS: -fsanitize=address,undefined
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure
         run: cmake -S . -B build -DXSTATE_BUILD_TESTS=ON
       - name: Build

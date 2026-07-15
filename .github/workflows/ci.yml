@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-latest
+            cc: clang
+            cxx: clang++
+          - os: macos-latest
+            cc: clang
+            cxx: clang++
+          - os: windows-latest
+            cc: cl
+            cxx: cl
+    runs-on: ${{ matrix.os }}
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DXSTATE_BUILD_TESTS=ON -DXSTATE_BUILD_EXAMPLES=ON
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+  warnings:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            flags: -Wall -Wextra -Werror
+          - os: windows-latest
+            flags: /W4 /WX
+    runs-on: ${{ matrix.os }}
+    env:
+      # appended to CMake's platform defaults (keeps MSVC's /EHsc), unlike
+      # overriding CMAKE_CXX_FLAGS which would replace them
+      CXXFLAGS: ${{ matrix.flags }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DXSTATE_BUILD_TESTS=ON -DXSTATE_BUILD_EXAMPLES=ON
+      - name: Build
+        run: cmake --build build
+
+  asan:
+    runs-on: ubuntu-latest
+    env:
+      CXXFLAGS: -fsanitize=address,undefined -g
+      LDFLAGS: -fsanitize=address,undefined
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DXSTATE_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

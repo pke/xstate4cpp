@@ -1,0 +1,13 @@
+function(xstate_example name)
+  add_executable(${name} ${name}.cpp)
+  target_link_libraries(${name} PRIVATE xstate::xstate)
+  if(UNIX)
+    find_package(Threads REQUIRED)
+    target_link_libraries(${name} PRIVATE Threads::Threads)
+  endif()
+endfunction()
+
+xstate_example(toggle)
+xstate_example(fetch)
+xstate_example(traffic_light)
+xstate_example(nfc_session)

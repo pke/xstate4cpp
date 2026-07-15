@@ -29,6 +29,7 @@ struct StateNode {
   StateNode* historyDefault = nullptr;               // resolved history target
 
   std::vector<ActionRef<C>> entry, exit;
+  std::vector<ActionRef<C>> initialActions;  // actions of the initial transition
 
   struct TransitionDef {
     std::string eventType;             // "" = eventless (always)

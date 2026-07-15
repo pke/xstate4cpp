@@ -178,13 +178,14 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
     auto snap = std::make_shared<Snap>();
     snap->machine = this->shared_from_this();
     std::vector<const Node*> cfg;
-    addInitial(root_.get(), cfg);
+    std::set<const Node*> viaInitial;
+    addInitial(root_.get(), cfg, &viaInitial, false);
     C draft = config_.context;
     std::deque<Event> internalQ;
     MicroCtx mc{draft, scope, &internalQ, 0};
     const Event initEvent = events::init();
     emitInvokeEffects({}, cfg, scope);  // children exist before entry sendTo effects
-    for (const Node* n : cfg) executeActions(n->entry, mc, initEvent);
+    executeEntryActions(cfg, viaInitial, mc, initEvent);
     emitDelayEffects({}, cfg, draft, initEvent, scope);
     snap->configuration = std::move(cfg);
     snap->context = std::move(draft);
@@ -394,19 +395,25 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
   }
 
   // Configuration = all active nodes (atomics + their ancestors), document order.
-  void addInitial(const Node* n, std::vector<const Node*>& cfg) const {
+  // Nodes reached by descending through `initial` are recorded in `viaInitial`
+  // (when provided): entering such a node "takes" its parent's initial
+  // transition, which runs the parent's initialActions.
+  void addInitial(const Node* n, std::vector<const Node*>& cfg,
+                  std::set<const Node*>* viaInitial = nullptr,
+                  bool isViaInitial = false) const {
     // history nodes never join the configuration; resolve through them
     // (no recorded value can exist on an initial path -> default target)
     if (n->type == StateType::History) {
-      if (n->historyDefault != nullptr) addInitial(n->historyDefault, cfg);
+      if (n->historyDefault != nullptr) addInitial(n->historyDefault, cfg, viaInitial, false);
       return;
     }
     cfg.push_back(n);
+    if (viaInitial != nullptr && isViaInitial) viaInitial->insert(n);
     if (n->type == StateType::Parallel) {
       for (const auto& ch : n->children)
-        if (ch->type != StateType::History) addInitial(ch.get(), cfg);
+        if (ch->type != StateType::History) addInitial(ch.get(), cfg, viaInitial, true);
     } else if (n->initial != nullptr) {
-      addInitial(n->initial, cfg);
+      addInitial(n->initial, cfg, viaInitial, true);
     }
   }
 
@@ -581,7 +588,8 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
   // History targets resolve to their stored configuration, default target,
   // or the parent's initial state; the history node itself is never entered.
   void computeEntrySet(const Node* domain, const Node* target,
-                       std::vector<const Node*>& entered, const HistoryMap& hist) const {
+                       std::vector<const Node*>& entered, const HistoryMap& hist,
+                       std::set<const Node*>& viaInitial) const {
     if (target->type == StateType::History) {
       const Node* p = target->parent;
       pushChain(domain, p, entered);
@@ -590,18 +598,18 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
         for (const Node* stored : it->second) {
           pushChain(p, stored->parent, entered);
           if (std::find(entered.begin(), entered.end(), stored) == entered.end())
-            addInitial(stored, entered);
+            addInitial(stored, entered, &viaInitial, false);
         }
       } else if (target->historyDefault != nullptr) {
-        computeEntrySet(domain, target->historyDefault, entered, hist);
+        computeEntrySet(domain, target->historyDefault, entered, hist, viaInitial);
       } else if (p->initial != nullptr) {
-        computeEntrySet(domain, p->initial, entered, hist);
+        computeEntrySet(domain, p->initial, entered, hist, viaInitial);
       }
       return;
     }
     pushChain(domain, target->parent, entered);
     if (std::find(entered.begin(), entered.end(), target) == entered.end())
-      addInitial(target, entered);
+      addInitial(target, entered, &viaInitial, false);
   }
 
   // ---- delayed transitions (after) ----
@@ -812,10 +820,12 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
 
     // entry set
     std::vector<const Node*> entered;
+    std::set<const Node*> viaInitial;
     for (const TransitionDef* def : selected) {
       if (def->targets.empty()) continue;
       const Node* domain = transitionDomain(def);
-      for (const Node* t : def->targets) computeEntrySet(domain, t, entered, newHistory);
+      for (const Node* t : def->targets)
+        computeEntrySet(domain, t, entered, newHistory, viaInitial);
     }
 
     // new configuration = (active - exited) + entered (deduped), doc order
@@ -829,14 +839,14 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
     // configuration completion: an active compound needs an active child, an
     // active parallel needs ALL regions active (e.g. a cross-region target
     // exited the source region — it re-enters via its initial states)
-    completeConfiguration(nextActive, toEnter);
+    completeConfiguration(nextActive, toEnter, viaInitial);
     std::sort(toEnter.begin(), toEnter.end(),
               [](const Node* a, const Node* b) { return a->docIndex < b->docIndex; });
 
     // invoked children spawn before entry actions execute so that entry
     // sendTo(childId, ...) effects find their target
     emitInvokeEffects({}, toEnter, scope);
-    for (const Node* n : toEnter) executeActions(n->entry, mc, event);
+    executeEntryActions(toEnter, viaInitial, mc, event);
     emitDelayEffects({}, toEnter, draft, event, scope);
 
     auto next = std::make_shared<Snap>();
@@ -855,9 +865,10 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
   }
 
   // Expand incomplete compound/parallel nodes down to their initial states,
-  // treating everything added as freshly entered.
+  // treating everything added as freshly entered (via initial transitions).
   void completeConfiguration(std::set<const Node*>& nextActive,
-                             std::vector<const Node*>& toEnter) const {
+                             std::vector<const Node*>& toEnter,
+                             std::set<const Node*>& viaInitial) const {
     bool changed = true;
     while (changed) {
       changed = false;
@@ -866,12 +877,13 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
         std::vector<const Node*> add;
         if (n->type == StateType::Parallel) {
           for (const auto& region : n->children)
-            if (nextActive.count(region.get()) == 0) addInitial(region.get(), add);
+            if (nextActive.count(region.get()) == 0)
+              addInitial(region.get(), add, &viaInitial, true);
         } else if (n->type == StateType::Compound && n->initial != nullptr) {
           bool hasActiveChild = false;
           for (const auto& ch : n->children)
             if (nextActive.count(ch.get()) != 0) { hasActiveChild = true; break; }
-          if (!hasActiveChild) addInitial(n->initial, add);
+          if (!hasActiveChild) addInitial(n->initial, add, &viaInitial, true);
         }
         for (const Node* a : add)
           if (nextActive.insert(a).second) {
@@ -879,6 +891,19 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
             changed = true;
           }
       }
+    }
+  }
+
+  // Entry actions in document order; a node entered by taking its parent's
+  // initial transition runs that transition's actions first (outer before
+  // inner, exactly once).
+  void executeEntryActions(const std::vector<const Node*>& toEnter,
+                           const std::set<const Node*>& viaInitial, MicroCtx& mc,
+                           const Event& event) {
+    for (const Node* n : toEnter) {
+      if (viaInitial.count(n) != 0 && n->parent != nullptr && n->parent->initial == n)
+        executeActions(n->parent->initialActions, mc, event);
+      executeActions(n->entry, mc, event);
     }
   }
 
@@ -958,13 +983,14 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
 
   void wireRoot() {
     std::size_t i = 0;
-    wireCommon(root_.get(), config_.initial, config_.on, config_.always, "");
+    wireCommon(root_.get(), config_.initial, config_.initialActions, config_.on,
+               config_.always, "");
     for (auto& [key, sc] : config_.states)
       wireNode(root_->children[i++].get(), sc, "states." + key);
   }
 
   void wireNode(Node* node, StateConfig<C>& sc, const std::string& cfgPath) {
-    wireCommon(node, sc.initial, sc.on, sc.always, cfgPath);
+    wireCommon(node, sc.initial, sc.initialActions, sc.on, sc.always, cfgPath);
 
     // history default target
     if (node->type == StateType::History && !sc.target.empty())
@@ -1012,6 +1038,7 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
   }
 
   void wireCommon(Node* node, const std::string& initialName,
+                  const std::vector<ActionRef<C>>& initialActions,
                   OrderedMap<TransitionList<C>>& on,
                   std::vector<TransitionConfig<C>>& always,
                   const std::string& cfgPath) {
@@ -1022,6 +1049,12 @@ class Machine : public ActorLogic, public std::enable_shared_from_this<Machine<C
       node->initial = node->childByKey(initialName);
       if (node->initial == nullptr)
         fail(prefix + "initial", "unknown initial state '" + initialName + "'");
+    }
+    if (!initialActions.empty()) {
+      if (node->initial == nullptr)
+        fail(prefix + "initialActions", "initial actions require an initial state");
+      validateActions(initialActions, prefix + "initialActions");
+      node->initialActions = initialActions;
     }
     for (auto& [evt, list] : on) {
       if (list.list.empty()) {

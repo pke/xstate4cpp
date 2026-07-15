@@ -181,6 +181,7 @@ struct StateConfig {
   HistoryType history = HistoryType::Shallow;
   std::string id;       // for "#id" targets
   std::string initial;
+  std::vector<ActionRef<C>> initialActions;  // run when the initial transition is taken
   std::string target;   // history default target
   std::vector<ActionRef<C>> entry, exit;
   OrderedMap<TransitionList<C>> on;  // "*" wildcard supported
@@ -198,6 +199,7 @@ struct MachineConfig {
   std::string id = "(machine)";
   StateType type = StateType::Compound;  // Compound or Parallel roots only
   std::string initial;
+  std::vector<ActionRef<C>> initialActions;  // run when the root initial transition is taken
   C context{};
   OrderedMap<StateConfig<C>> states;
   std::vector<ActionRef<C>> entry, exit;

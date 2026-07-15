@@ -173,7 +173,13 @@ void jsonToState(const JsonValue& v, StateConfig<C>& out) {
     } else if (key == "id") {
       out.id = val.str;
     } else if (key == "initial") {
-      out.initial = val.str;
+      if (val.isObject()) {  // initial: { target, actions }
+        if (const JsonValue* target = val.find("target")) out.initial = target->str;
+        if (const JsonValue* actions = val.find("actions"))
+          out.initialActions = jsonToActions<C>(*actions);
+      } else {
+        out.initial = val.str;
+      }
     } else if (key == "target") {
       out.target = val.str;
     } else if (key == "entry") {
@@ -226,7 +232,13 @@ MachineConfig<C> parseMachineJson(std::string_view json,
     if (key == "id") {
       cfg.id = val.str;
     } else if (key == "initial") {
-      cfg.initial = val.str;
+      if (val.isObject()) {
+        if (const detail::JsonValue* target = val.find("target")) cfg.initial = target->str;
+        if (const detail::JsonValue* actions = val.find("actions"))
+          cfg.initialActions = detail::jsonToActions<C>(*actions);
+      } else {
+        cfg.initial = val.str;
+      }
     } else if (key == "context") {
       if (codec == nullptr)
         throw JsonError("machine config has 'context' but no ContextCodec was provided");
